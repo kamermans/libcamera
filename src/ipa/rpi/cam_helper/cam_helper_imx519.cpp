@@ -16,6 +16,7 @@
 #include <libcamera/base/log.h>
 
 #include "cam_helper.h"
+#include "controller/pdaf_data.h"
 #include "md_parser.h"
 
 using namespace RPiController;
@@ -64,8 +65,14 @@ private:
 	/* Largest long exposure scale factor given as a left shift on the frame length. */
 	static constexpr int longExposureShiftMax = 7;
 
+	static constexpr int pdafStatsRows = 12;
+	static constexpr int pdafStatsCols = 16;
+
 	void populateMetadata(const MdParser::RegisterMap &registers,
 			      Metadata &metadata) const override;
+
+	static bool parsePdafData(const uint8_t *ptr, size_t len, unsigned bpp,
+				  PdafRegions &pdaf);
 };
 
 CamHelperImx519::CamHelperImx519()
@@ -94,6 +101,20 @@ void CamHelperImx519::prepare(libcamera::Span<const uint8_t> buffer, Metadata &m
 	}
 
 	parseEmbeddedData(buffer, metadata);
+
+	/*
+	 * Parse PDAF data, which we expect to occupy the third scanline
+	 * of embedded data. As PDAF is quite sensor-specific, it's parsed here.
+	 */
+	size_t bytesPerLine = (mode_.width * mode_.bitdepth) >> 3;
+
+	if (buffer.size() > 2 * bytesPerLine) {
+		PdafRegions pdaf;
+		if (parsePdafData(&buffer[2 * bytesPerLine],
+				  buffer.size() - 2 * bytesPerLine,
+				  mode_.bitdepth, pdaf))
+			metadata.set("pdaf.regions", pdaf);
+	}
 
 	/*
 	 * The DeviceStatus struct is first populated with values obtained from
@@ -175,6 +196,34 @@ void CamHelperImx519::populateMetadata(const MdParser::RegisterMap &registers,
 	deviceStatus.frameLength = registers.at(frameLengthHiReg) * 256 + registers.at(frameLengthLoReg);
 
 	metadata.set("device.status", deviceStatus);
+}
+
+bool CamHelperImx519::parsePdafData(const uint8_t *ptr, size_t len,
+				    unsigned bpp, PdafRegions &pdaf)
+{
+	size_t step = bpp >> 1;
+
+	if (bpp < 10 || bpp > 12 || len < 194 * step || ptr[0] != 0 || ptr[1] >= 0x40) {
+		LOG(IPARPI, Error) << "PDAF data in unsupported format";
+		return false;
+	}
+
+	pdaf.init({ pdafStatsCols, pdafStatsRows });
+
+	ptr += 2 * step;
+	for (unsigned i = 0; i < pdafStatsRows; ++i) {
+		for (unsigned j = 0; j < pdafStatsCols; ++j) {
+			unsigned c = (ptr[0] << 3) | (ptr[1] >> 5);
+			int p = (((ptr[1] & 0x0F) - (ptr[1] & 0x10)) << 6) | (ptr[2] >> 2);
+			PdafData pdafData;
+			pdafData.conf = c;
+			pdafData.phase = c ? p : 0;
+			pdaf.set(libcamera::Point(j, i), { pdafData, 1, 0 });
+			ptr += step;
+		}
+	}
+
+	return true;
 }
 
 static CamHelper *create()
